@@ -24,8 +24,6 @@ An AI-powered outbound calling agent that contacts El Al passengers who haven't 
 | `Screenshots/` | Agent configuration, conversation flow, and results table |
 | `additions/appscript.txt` | Google Apps Script — the webhook connecting Vapi to the data source |
 | `additions/natbag description navi.txt` | Knowledge base file used by Dana (Terminal 3 navigation) |
-| `architecture.md` | System architecture and conversation flow |
-| `model_decisions.md` | Provider selection rationale (STT, LLM, TTS, pipeline vs realtime) |
 
 ### How it works
 

@@ -13,7 +13,7 @@ const PRIORITY = { unaccompanied_minor: 0, requires_assistance: 1, standard: 2 }
 const TERMINAL_OUTCOMES = ['detained','medical','passport_lost','third_party_only','transferred'];
 const NO_ANSWER_REASONS = ['voicemail','customer-did-not-answer','dial-failed','twilio-failed-to-connect'];
 
-const SHEET_ID = '11uXCZRuDk9WPFTiGJ2aSgpH8KOLonGFU2txZP0DJt-A';
+const SHEET_ID = 'YOUR_GOOGLE_SHEET_ID_HERE';
 
 // ============== Vapi webhook entry point ==============
 
