@@ -12,21 +12,24 @@ An AI-powered outbound calling agent that contacts El Al passengers who haven't 
 
 **Built on:** Vapi · GPT-4.1 · Deepgram Nova-3 · ElevenLabs v3
 
-### Key files
+### Repository contents
 
-| File | Description |
+| Path | Description |
 |---|---|
-| `Submission/System prompt.txt` | Full Hebrew system prompt with dynamic variables |
-| `Submission/agent_export.json` | Vapi agent configuration export |
-| `Submission/passengers - mock data.xlsx` | Mock passenger data source (≥3 rows) |
-| `Submission/הקלטות וסיכומים/` | MP3 recordings + post-call summaries for each passenger |
-| `Submission/appscript.txt` | Google Apps Script — the webhook that connects Vapi to the data source |
-| `model_decisions.md` | Provider selection rationale (STT, LLM, TTS, architecture) |
+| `System prompt.txt` | Full Hebrew system prompt with dynamic variables |
+| `agent_export.json` | Vapi agent configuration export |
+| `passengers - mock data.xlsx` | Mock passenger data source (≥3 rows) |
+| `conversations_table.pdf` | Summary table of example calls and their written-back outcomes |
+| `Recording/` | MP3 of an outbound Hebrew call + transcript |
+| `Screenshots/` | Agent configuration, conversation flow, and results table |
+| `additions/appscript.txt` | Google Apps Script — the webhook connecting Vapi to the data source |
+| `additions/natbag description navi.txt` | Knowledge base file used by Dana (Terminal 3 navigation) |
 | `architecture.md` | System architecture and conversation flow |
+| `model_decisions.md` | Provider selection rationale (STT, LLM, TTS, pipeline vs realtime) |
 
 ### How it works
 
-```
+```text
 Vapi triggers outbound call
        │
        ▼
@@ -44,7 +47,7 @@ Call ends (hangup / transfer to human)
 
 ### Tool functions
 
-Dana has four tools registered in Vapi. All HTTP calls go to the Google Apps Script webhook (`Submission/appscript.txt`).
+Dana has four tools registered in Vapi. All HTTP calls go to the Google Apps Script webhook (`additions/appscript.txt`).
 
 #### `get_passenger_data`
 
@@ -96,12 +99,12 @@ Transfers the live call to a human El Al agent. Called after `summarize_call` in
 
 Explicitly ends the call. Used when there is no answer. In most flows, Vapi auto-hangs on the farewell phrase — `end_phone_call` is only invoked for the no-answer case.
 
-### Recorded conversations
+### Example conversations (see `conversations_table.pdf`)
 
 | Passenger | Scenario | Outcome |
 |---|---|---|
 | דנה לוי | מתפנה ובאה | `on_the_way` — אישרה הגעה |
-| משה אברהם | מסרב + כבודה | `third_party_only` — סירוב, כבודה תורד |
+| משה אברהם | מסרב + כבודה | `third_party_only` — סירוב, כבודה תורד (recording in `Recording/`) |
 | רינה גולדברג | זקוקה לעזרה + כבודה | `transferred` — הועברה לנציג |
 
 ---
@@ -113,12 +116,13 @@ A CLI tool that ingests TXT or PDF files, creates embeddings via OpenAI, and ans
 ### Setup
 
 ```bash
-cd "Submission/Python Task"
+cd "Python Task"
 pip install -r requirements.txt
 ```
 
 Create a `.env` file:
-```
+
+```env
 OPENAI_API_KEY=your_key_here
 ```
 
@@ -134,4 +138,4 @@ python app.py search "your question here"
 
 ### Pipeline
 
-File → extract text → overlapping chunks → embed each chunk (OpenAI `text-embedding-3-small`) → store locally → on query, embed the question and return top-k chunks by cosine similarity.
+File → extract text → overlapping chunks → embed each chunk (OpenAI `text-embedding-3-small`) → store locally in `store.json` → on query, embed the question and return top-k chunks by cosine similarity.
