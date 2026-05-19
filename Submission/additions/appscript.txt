@@ -1,0 +1,567 @@
+// ============================================================
+// VAPI SHEETS BRIDGE (DANA BACKEND)
+// Functions: inject, pick, handleAssistantRequest, handleEndOfCall
+// ============================================================
+
+const SHEETS = {
+  PASSENGERS: 'passengers',
+  LATE: 'late_passengers',
+  CONFIG: 'config'
+};
+
+const PRIORITY = { unaccompanied_minor: 0, requires_assistance: 1, standard: 2 };
+const TERMINAL_OUTCOMES = ['detained','medical','passport_lost','third_party_only','transferred'];
+const NO_ANSWER_REASONS = ['voicemail','customer-did-not-answer','dial-failed','twilio-failed-to-connect'];
+
+const SHEET_ID = '11uXCZRuDk9WPFTiGJ2aSgpH8KOLonGFU2txZP0DJt-A';
+
+// ============== Vapi webhook entry point ==============
+
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+    const type = body.message?.type || "unknown";
+    
+    logRadar('Vapi Hit: ' + type, body.message?.call?.id);
+    
+    if (type === 'assistant-request')  return handleAssistantRequest(body);
+    if (type === 'tool-calls')         return handleToolCall(body);
+    if (type === 'end-of-call-report') return handleEndOfCall(body);
+
+    return jsonResponse({ ignored: true, type });
+  } catch (err) {
+    return jsonResponse({ error: err.toString() });
+  }
+}
+
+// ============== Injector — runs every minute ==============
+
+function injectLatePassengers() {
+  const pSheet = getSheet(SHEETS.PASSENGERS);
+  const lSheet = getSheet(SHEETS.LATE);
+  const pData  = pSheet.getDataRange().getValues();
+  const lData  = lSheet.getDataRange().getValues();
+  const pHead  = pData[0];
+
+  const already = new Set();
+  for (let i = 1; i < lData.length; i++) {
+    if (lData[i][0] !== '') already.add(String(lData[i][0]));
+  }
+
+  const now = new Date();
+  const windowEnd = new Date(now.getTime() + 15 * 60 * 1000);
+  const rows = [];
+
+  for (let i = 1; i < pData.length; i++) {
+    const p = {};
+    pHead.forEach((h, idx) => { p[h] = pData[i][idx]; });
+
+    if (already.has(String(p.record_id))) continue;
+    if (!asBool(p.checked_in)) continue;
+    if (asBool(p.boarded)) continue;
+
+    const close = asDate(p.gate_closing_time);
+    if (!close || close < now || close > windowEnd) continue;
+
+    rows.push([
+      p.record_id, p.passenger_name, p.flight_number, p.destination, p.gate,
+      close, p.phone_number, asBool(p.has_checked_baggage), p.companions || '',
+      p.passenger_type || 'standard',
+      0, '', 'pending', '', false, '', now
+    ]);
+  }
+
+  if (rows.length) {
+    lSheet.getRange(lSheet.getLastRow() + 1, 1, rows.length, 17).setValues(rows);
+  }
+  setConfigField('last_injection', new Date());
+  return rows.length;
+}
+
+// ============== Picker — runs every minute ==============
+
+function pickCurrentPassenger() {
+  const sheet = getSheet(SHEETS.LATE);
+  const data  = sheet.getDataRange().getValues();
+  const head  = data[0];
+  const col   = n => head.indexOf(n);
+
+  const now = Date.now();
+  const eligible = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const status   = String(r[col('call_status')] || '').toLowerCase();
+    const attempts = Number(r[col('call_attempts')] || 0);
+    if (attempts >= 2) continue;
+    if (status !== 'pending' && status !== '') continue;
+    if (String(r[col('passenger_type')] || '').toLowerCase() === 'unaccompanied_minor') continue;
+
+    const close = asDate(r[col('gate_closing_time')]);
+    if (!close) continue;
+    const mins = (close.getTime() - now) / 60000;
+    if (mins <= 0) continue;
+
+    eligible.push({
+      record_id: r[col('record_id')],
+      mins,
+      type: PRIORITY[r[col('passenger_type')]] ?? 2,
+      bag: asBool(r[col('has_checked_baggage')]) ? 0 : 1
+    });
+  }
+
+  eligible.sort((a, b) =>
+    a.mins - b.mins || a.type - b.type || a.bag - b.bag
+  );
+
+  const winner = eligible.length ? eligible[0].record_id : 0;
+  setNamedRange('current_passenger', winner);
+  setConfigField('last_picker_run', new Date());
+  return winner;
+}
+
+// ============== Shared passenger lookup ==============
+// Reads current_passenger named range, finds the row, marks it in_progress,
+// stamps last_call_time, and returns a normalized object for downstream use.
+
+function lookupCurrentPassenger(callId) {
+  const recordId = getNamedRange('current_passenger');
+  if (!recordId || recordId === 0) return null;
+
+  const sheet = getSheet(SHEETS.LATE);
+  const data  = sheet.getDataRange().getValues();
+  const head  = data[0];
+
+  let rowIdx = -1, row = null;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] == recordId) { row = data[i]; rowIdx = i + 1; break; }
+  }
+  if (!row) return null;
+
+  sheet.getRange(rowIdx, head.indexOf('call_status') + 1).setValue('in_progress');
+  sheet.getRange(rowIdx, head.indexOf('last_call_time') + 1).setValue(new Date());
+  // Stash callId↔recordId so handleEndOfCall can find the row even if
+  // current_passenger gets reset or overwritten by the cron mid-call.
+  if (callId && recordId) setConfigField('call_' + callId, recordId);
+
+  const p = {};
+  head.forEach((h, idx) => { p[h] = row[idx]; });
+  const close = asDate(p.gate_closing_time);
+  const mins  = close ? Math.round((close.getTime() - Date.now()) / 60000) : null;
+
+  return {
+    record_id: p.record_id,
+    passenger_name: p.passenger_name,
+    flight_number: p.flight_number,
+    destination: p.destination,
+    gate: p.gate,
+    minutes_to_closing: mins,
+    has_checked_baggage: asBool(p.has_checked_baggage) ? "Yes" : "No",
+    companions: p.companions || "",
+    passenger_type: p.passenger_type || "standard"
+  };
+}
+
+// ============== Vapi Server URL: assistant-request ==============
+// Used when the call is started WITHOUT an assistantId (API-initiated flow).
+// Talk button does NOT hit this — see handleToolCall for that path.
+
+function handleAssistantRequest(body) {
+  const p = lookupCurrentPassenger();
+  if (!p) {
+    return jsonResponse({
+      assistant: { firstMessage: "Error: No active passenger found." }
+    });
+  }
+
+  const explicitFirstMessage = `שלום ${p.passenger_name}, מדברת דנה מאל-על. הטיסה שלכם ל-${p.destination} יוצאת בעוד כמה דקות. איפה אתם?`;
+
+  return jsonResponse({
+    assistant: {
+      firstMessage: explicitFirstMessage,
+      variableValues: {
+        record_id: p.record_id,
+        passenger_name: p.passenger_name,
+        flight_number: p.flight_number,
+        destination: p.destination,
+        gate: p.gate,
+        minutes_to_closing: p.minutes_to_closing,
+        has_checked_baggage: p.has_checked_baggage,
+        companions: p.companions
+      }
+    }
+  });
+}
+
+// ============== Vapi Server URL: tool-calls ==============
+// Triggered when Dana invokes the `get_passenger_data` tool mid-call
+// (this is the path used by the Talk button in the dashboard).
+
+function handleToolCall(body) {
+  const callId = body.message?.call?.id;
+  const toolCalls = body.message?.toolCallList
+                 || body.message?.toolCalls
+                 || [];
+
+  const results = toolCalls.map(tc => {
+    const name = tc.function?.name || tc.name;
+    const id   = tc.id || tc.toolCallId;
+
+    if (name === 'get_passenger_data') {
+      const p = lookupCurrentPassenger(callId);
+      return {
+        toolCallId: id,
+        result: p ? JSON.stringify(p) : "No active passenger found."
+      };
+    }
+
+    if (name === 'summarize_call') {
+      const args = tc.function?.arguments || tc.arguments || {};
+      const params = typeof args === 'string' ? JSON.parse(args) : args;
+      const result = writeCallOutcome(callId, params);
+      // Hang up via Vapi API after writing — non-blocking, best-effort
+      try {
+        const apiKey = PropertiesService.getScriptProperties().getProperty('VAPI_API_KEY');
+        if (apiKey && callId) {
+          UrlFetchApp.fetch('https://api.vapi.ai/call/' + callId, {
+            method: 'patch',
+            headers: { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+            payload: JSON.stringify({ status: 'ended' }),
+            muteHttpExceptions: true
+          });
+        }
+      } catch (e) { logRadar('end_call hangup error: ' + e, callId); }
+      return { toolCallId: id, result: JSON.stringify(result) };
+    }
+
+    return { toolCallId: id, result: `Unknown tool: ${name}` };
+  });
+
+  return jsonResponse({ results });
+}
+// ============== Tool: write_call_outcome ==============
+
+function writeCallOutcome(callId, params) {
+  logRadar('writeCallOutcome params: ' + JSON.stringify(params), callId);
+
+  const recordId = params.record_id
+                || (callId && getConfigField('call_' + callId))
+                || getNamedRange('current_passenger');
+
+  logRadar('writeCallOutcome recordId resolved: ' + recordId + ' (type=' + typeof recordId + ')', callId);
+
+  if (!isValidRecordId(recordId)) {
+    logRadar('writeCallOutcome: no valid recordId', callId);
+    return { success: false, error: 'no record_id' };
+  }
+
+  const outcome  = params.outcome || 'unknown';
+  const summary  = params.call_summary_he || '';
+  const baggage  = params.baggage_offload_required === true || params.baggage_offload_required === 'true';
+
+  let callStatus = 'resolved';
+  if (TERMINAL_OUTCOMES.includes(outcome))    callStatus = 'escalated';
+  else if (outcome === 'line_issue')           callStatus = 'no_answer';
+
+  const sheet = getSheet(SHEETS.LATE);
+  const data  = sheet.getDataRange().getValues();
+  const head  = data[0];
+  const c = n => head.indexOf(n) + 1;
+
+  let rowIdx = -1, attempts = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] == recordId) {
+      rowIdx = i + 1;
+      attempts = Number(data[i][head.indexOf('call_attempts')] || 0);
+      break;
+    }
+  }
+  if (rowIdx === -1) {
+    logRadar('writeCallOutcome: row not found rec=' + recordId, callId);
+    return { success: false, error: 'row not found' };
+  }
+
+  sheet.getRange(rowIdx, c('call_status')).setValue(callStatus);
+  sheet.getRange(rowIdx, c('call_summary')).setValue(summary);
+  sheet.getRange(rowIdx, c('baggage_offload_required')).setValue(baggage);
+  sheet.getRange(rowIdx, c('call_attempts')).setValue(attempts + 1);
+  sheet.getRange(rowIdx, c('last_updated')).setValue(new Date());
+  setNamedRange('current_passenger', 0);
+
+  logRadar('writeCallOutcome OK rec=' + recordId + ' outcome=' + outcome, callId);
+  return { success: true, record_id: recordId, call_status: callStatus };
+}
+
+// ============== End-of-call writeback ==============
+
+function handleEndOfCall(body) {
+  const m = body.message;
+  const callId = m.call?.id;
+  const _cfgRecordId = callId && getConfigField('call_' + callId);
+  const recordId = (isValidRecordId(_cfgRecordId) && _cfgRecordId)
+                || m.call?.assistantOverrides?.variableValues?.record_id
+                || m.call?.metadata?.record_id
+                || getNamedRange('current_passenger');
+  if (!isValidRecordId(recordId)) {
+    logRadar('end-of-call FAILED: no valid recordId (raw=' + recordId + ')', callId);
+    return jsonResponse({ error: 'No record_id available', callId });
+  }
+
+  const ext = extractAnalysis(m);
+  logRadar('analysis keys: ' + Object.keys(ext).join(',') + ' | analysis top: ' + Object.keys(m.analysis || {}).join(','), callId);
+  const outcome      = ext.outcome || 'unknown';
+  const summaryHe    = ext.call_summary_he || m.analysis?.summary || m.summary || '';
+  const finalStatusHe= ext.final_status_he || '';
+  const baggage      = ext.baggage_offload_required ?? false;
+
+  let callStatus = 'resolved';
+  if (TERMINAL_OUTCOMES.includes(outcome))                       callStatus = 'escalated';
+  else if (m.endedReason === 'assistant-forwarded-call')         callStatus = 'escalated';
+  else if (outcome === 'line_issue' || NO_ANSWER_REASONS.includes(m.endedReason)) callStatus = 'no_answer';
+
+  const sheet = getSheet(SHEETS.LATE);
+  const data  = sheet.getDataRange().getValues();
+  const head  = data[0];
+  const c = n => head.indexOf(n) + 1;
+
+  let rowIdx = -1, attempts = 0, existingSummary = '';
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] == recordId) {
+      rowIdx = i + 1;
+      attempts = Number(data[i][head.indexOf('call_attempts')] || 0);
+      existingSummary = String(data[i][head.indexOf('call_summary')] || '');
+      break;
+    }
+  }
+  if (rowIdx === -1) {
+    logRadar('end-of-call: row not found rec=' + recordId, callId);
+    return jsonResponse({ error: `Row ${recordId} not found` });
+  }
+
+  // If end_call tool already wrote a summary, don't overwrite — just ensure current_passenger is cleared.
+  if (existingSummary) {
+    logRadar('end-of-call: summary already written by end_call tool, skipping overwrite', callId);
+    setNamedRange('current_passenger', 0);
+    return jsonResponse({ success: true, skipped: true, record_id: recordId });
+  }
+
+  // end_call tool did NOT run (user dropped, timeout, etc.) — write what we have and schedule analysis fetch.
+  const newAttempts = attempts + 1;
+  const droppedStatus = NO_ANSWER_REASONS.includes(m.endedReason) ? 'no_answer' : 'resolved';
+  const finalStatus = (droppedStatus === 'no_answer' && newAttempts < 2) ? 'pending' : droppedStatus;
+
+  sheet.getRange(rowIdx, c('call_status')).setValue(finalStatus);
+  sheet.getRange(rowIdx, c('call_attempts')).setValue(newAttempts);
+  sheet.getRange(rowIdx, c('last_updated')).setValue(new Date());
+  setNamedRange('current_passenger', 0);
+
+  // Schedule delayed fetch to get Vapi's transcript-based summary as fallback
+  if (callId) {
+    try {
+      const trigger = ScriptApp.newTrigger('fetchAnalysisAndFinalize')
+        .timeBased().after(25 * 1000).create();
+      setConfigField('trigger_' + trigger.getUniqueId(), callId);
+      setConfigField('call_' + callId, recordId);
+      logRadar('trigger scheduled (dropped call) id=' + trigger.getUniqueId(), callId);
+    } catch (trigErr) {
+      logRadar('trigger creation FAILED: ' + trigErr, callId);
+    }
+  }
+
+  logRadar('end-of-call OK rec=' + recordId + ' status=' + finalStatus + ' (no tool summary)', callId);
+  return jsonResponse({ success: true, record_id: recordId, call_status: finalStatus });
+}
+
+// ============== Delayed analysis fetch (~25 s after call end) ==============
+
+function fetchAnalysisAndFinalize(e) {
+  const triggerId = e?.triggerUid;
+  if (!triggerId) return;
+
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getUniqueId() === triggerId)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  const callId = getConfigField('trigger_' + triggerId);
+  clearConfigField('trigger_' + triggerId);
+  if (!callId) return;
+
+  const recordId = getConfigField('call_' + callId);
+  clearConfigField('call_' + callId);
+  if (!isValidRecordId(recordId)) {
+    logRadar('fetchAnalysis: no valid recordId for call ' + callId, callId);
+    return;
+  }
+
+  const sheet = getSheet(SHEETS.LATE);
+  const head  = sheet.getDataRange().getValues()[0];
+  fetchAndWriteAnalysis(callId, recordId, sheet, head);
+}
+
+// Shared: fetches Vapi analysis for callId and writes it to the sheet row for recordId.
+function fetchAndWriteAnalysis(callId, recordId, sheet, head) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('VAPI_API_KEY');
+  if (!apiKey) {
+    logRadar('fetchAnalysis: VAPI_API_KEY not set', callId);
+    return;
+  }
+
+  let callObj;
+  try {
+    const resp = UrlFetchApp.fetch('https://api.vapi.ai/call/' + callId, {
+      headers: { Authorization: 'Bearer ' + apiKey },
+      muteHttpExceptions: true
+    });
+    const status = resp.getResponseCode();
+    if (status !== 200) {
+      logRadar('fetchAnalysis HTTP ' + status + ': ' + resp.getContentText().substring(0, 120), callId);
+      return;
+    }
+    callObj = JSON.parse(resp.getContentText());
+  } catch (err) {
+    logRadar('fetchAnalysis fetch error: ' + err, callId);
+    return;
+  }
+  if (!callObj || !callObj.analysis) {
+    logRadar('fetchAnalysis: no analysis in response', callId);
+    return;
+  }
+
+  const ext = extractAnalysis(callObj);
+  logRadar('fetchAnalysis ext keys: ' + Object.keys(ext).join(','), callId);
+
+  const outcome       = ext.outcome;
+  const summaryHe     = ext.call_summary_he || callObj.analysis?.summary || '';
+  const finalStatusHe = ext.final_status_he || '';
+  const baggage       = ext.baggage_offload_required ?? null;
+
+  if (!summaryHe && !outcome) {
+    logRadar('fetchAnalysis: analysis still empty', callId);
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  const c = n => head.indexOf(n) + 1;
+
+  let rowIdx = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] == recordId) { rowIdx = i + 1; break; }
+  }
+  if (rowIdx === -1) {
+    logRadar('fetchAnalysis: row not found rec=' + recordId, callId);
+    return;
+  }
+
+  const summary = (finalStatusHe ? finalStatusHe + ' — ' : '') + summaryHe;
+  sheet.getRange(rowIdx, c('call_summary')).setValue(summary);
+  if (baggage !== null) sheet.getRange(rowIdx, c('baggage_offload_required')).setValue(baggage);
+  if (outcome && TERMINAL_OUTCOMES.includes(outcome)) {
+    sheet.getRange(rowIdx, c('call_status')).setValue('escalated');
+  }
+  sheet.getRange(rowIdx, c('last_updated')).setValue(new Date());
+  logRadar('fetchAnalysis OK rec=' + recordId + ' summary=' + summary.substring(0, 60), callId);
+}
+
+// ============== Helpers ==============
+
+function getSheet(name) {
+  return SpreadsheetApp.openById(SHEET_ID).getSheetByName(name);
+}
+function getNamedRange(name) {
+  try { return SpreadsheetApp.openById(SHEET_ID).getRangeByName(name)?.getValue(); }
+  catch (e) { return null; }
+}
+function setNamedRange(name, value) {
+  try { SpreadsheetApp.openById(SHEET_ID).getRangeByName(name)?.setValue(value); }
+  catch (e) {}
+}
+function setConfigField(label, value) {
+  const s = getSheet(SHEETS.CONFIG);
+  if (!s) return;
+  const d = s.getDataRange().getValues();
+  for (let i = 1; i < d.length; i++) {
+    if (String(d[i][0]).toLowerCase() === label.toLowerCase()) {
+      s.getRange(i + 1, 2).setValue(value);
+      return;
+    }
+  }
+  // not found — append
+  s.appendRow([label, value]);
+}
+function getConfigField(label) {
+  const s = getSheet(SHEETS.CONFIG);
+  if (!s) return null;
+  const d = s.getDataRange().getValues();
+  for (let i = 1; i < d.length; i++) {
+    if (String(d[i][0]).toLowerCase() === label.toLowerCase()) return d[i][1];
+  }
+  return null;
+}
+function clearConfigField(label) {
+  const s = getSheet(SHEETS.CONFIG);
+  if (!s) return;
+  const d = s.getDataRange().getValues();
+  for (let i = 1; i < d.length; i++) {
+    if (String(d[i][0]).toLowerCase() === label.toLowerCase()) {
+      s.deleteRow(i + 1);
+      return;
+    }
+  }
+}
+// Defensive extractor — Vapi's analysis payload shape varies by version.
+// Handles: structuredData (flat), structuredOutputs (object-keyed), and array form.
+function extractAnalysis(m) {
+  const a = m.analysis || {};
+
+  // Try both field names Vapi uses across versions
+  const containers = [a.structuredData, a.structuredOutputs];
+
+  for (const c of containers) {
+    if (!c || typeof c !== 'object') continue;
+    if (Array.isArray(c)) {
+      // Array of {name, result}
+      const first = c[0];
+      if (first) return (first.result !== undefined) ? first.result : first;
+    }
+    // Flat direct result
+    if ('outcome' in c || 'call_summary_he' in c) return c;
+    // UUID-keyed: { "<uuid>": { name, result: {...} } }
+    const first = Object.values(c)[0];
+    if (first && typeof first === 'object') {
+      if (first.result && typeof first.result === 'object') return first.result;
+      if ('outcome' in first || 'call_summary_he' in first) return first;
+    }
+  }
+  return {};
+}
+function logRadar(msg, callId) {
+  try {
+    const s = getSheet(SHEETS.CONFIG);
+    if (!s) return;
+    s.appendRow(['radar', new Date(), msg, callId || '']);
+  } catch (e) {}
+}
+// Returns false for 0, empty string, null, undefined, and Date objects (Sheets zero-date artifact)
+function isValidRecordId(v) {
+  if (!v && v !== 0) return false;
+  if (v instanceof Date) return false;
+  if (typeof v === 'number' && v === 0) return false;
+  if (typeof v === 'string' && v.trim() === '') return false;
+  return true;
+}
+function asBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string')  return v.trim().toUpperCase() === 'TRUE';
+  return Boolean(v);
+}
+function asDate(v) {
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if (typeof v === 'string' && v.trim()) {
+    const parsed = new Date(v.trim().replace(' ', 'T'));
+    return isNaN(parsed.getTime()) ? null : parsed;
+  }
+  return null;
+}
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}

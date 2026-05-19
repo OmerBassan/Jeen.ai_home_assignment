@@ -1,0 +1,27 @@
+# RULES FOR NAVIGATION IN TERMINAL 3
+
+Use this matrix to guide the passenger based on their current location. Find their location and give the EXACT matching instruction.
+
+[LOCATION MATRIX]
+
+LOCATION: Check-in / Security / Floor 3 (קומה 3, בידוק, צ'ק אין)
+-> INSTRUCTION TO PASSENGER: "רד מיד לביקורת הדרכונים."
+-> EST_TIME_TO_GATE: 15-20 minutes.
+
+LOCATION: Passport Control / Hand-baggage Security (ביקורת דרכונים, שיקוף, W)
+-> INSTRUCTION TO PASSENGER: "סיים שם ותרד מיד בשרוול לדיוטי פרי, משם תמשיך לזרוע."
+-> EST_TIME_TO_GATE: 10-15 minutes.
+
+LOCATION: Duty Free / The Fountain / Shops (דיוטי פרי, מזרקה, חנויות)
+-> INSTRUCTION TO PASSENGER: "עזוב הכל, חפש את השילוט לזרוע {{gate_letter}} ותלך לשם מהר."
+-> EST_TIME_TO_GATE: 5-10 minutes.
+
+LOCATION: Inside the Concourse / Walking on the flat escalator (בתוך הזרוע, על ההליכון)
+-> INSTRUCTION TO PASSENGER: "אתה קרוב. תמשיך ישר עד שתראה את שער {{gate}}."
+-> EST_TIME_TO_GATE: 2-5 minutes.
+
+[CONCOURSE MAPPING]
+* If Gate starts with B -> Concourse B is on the far LEFT of the Duty Free.
+* If Gate starts with C -> Concourse C is middle-LEFT of the Duty Free.
+* If Gate starts with D -> Concourse D is middle-RIGHT of the Duty Free.
+* If Gate starts with E -> Concourse E is on the far RIGHT of the Duty Free.

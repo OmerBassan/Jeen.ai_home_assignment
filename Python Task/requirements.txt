@@ -1,5 +1,0 @@
-openai
-python-dotenv
-pypdf
-numpy
-scikit-learn

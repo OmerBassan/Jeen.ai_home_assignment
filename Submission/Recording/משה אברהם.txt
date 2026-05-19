@@ -1,0 +1,1 @@
+{"5f7f2994-93dc-4992-b3bf-87f718ce5200":{"name":"call_outcome_data","result":{"outcome":"cancelled","call_summary_he":"הנוסע הודיע שלא יגיע לטיסה ואישר שאינו טס היום. עודכן שהכבודה תורד מהמטוס.","final_status_he":"הנוסע לא טס והכבודה תורד מהמטוס.","companion_missing":false,"third_party_pickup":false,"baggage_offload_required":true}}}

@@ -1,0 +1,15 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local vector store (generated at runtime)
+store.json
+
+# Claude Code local settings
+.claude/settings.local.json
